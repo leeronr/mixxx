@@ -1,0 +1,311 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+      branch:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
+    secrets:
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      DOWNLOADS_HOSTGATOR_DOT_MIXXX_DOT_ORG_KEY:
+        required: false
+      DOWNLOADS_HOSTGATOR_DOT_MIXXX_DOT_ORG_KEY_PASSWORD:
+        required: false
+      MACOS_CODESIGN_CERTIFICATE_P12_BASE64:
+        required: false
+      MACOS_CODESIGN_CERTIFICATE_PASSWORD:
+        required: false
+      MACOS_NOTARIZATION_APP_SPECIFIC_PASSWORD:
+        required: false
+      ANDROID_SIGNING_KEYSTORE_BASE64:
+        required: false
+      ANDROID_SIGNING_PASSWORD:
+        required: false
+      NETLIFY_BUILD_HOOK:
+        required: false
+      RRYAN_AT_MIXXX_DOT_ORG_GPG_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read #  to fetch code (actions/checkout)
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS 15 arm64
+            os: macos-15-intel
+            cmake_args: >-
+              -DBULK=ON
+              -DCOREAUDIO=ON
+              -DHSS1394=ON
+              -DMACOS_BUNDLE=ON
+              -DMODPLUG=ON
+              -DQT6=ON
+              -DQML=ON
+              -DWAVPACK=ON
+              -DVCPKG_TARGET_TRIPLET=arm64-osx-min1100-release
+            # TODO: Fix this broken test on macOS
+            crosscompile: true
+            cpack_generator: DragNDrop
+            compiler_cache: ccache
+            compiler_cache_path: /Users/runner/Library/Caches/ccache
+            compiler_cache_id: arm64
+            buildenv_basepath: /Users/runner/buildenv
+            buildenv_script: tools/macos_arm64-cross-release_buildenv.sh
+            artifacts_name: macOS ARM DMG
+            artifacts_path: build/*.dmg
+            artifacts_slug: macos-macosarm
+
+    env:
+      # macOS codesigning
+      MACOS_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_P12_BASE64 }}
+      MACOS_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_PASSWORD }}
+      # Android signing
+      ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+      ANDROID_SIGNING_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    container: ${{ matrix.container }}
+    outputs:
+      artifact-macos-macosarm: ${{ steps.prepare_deploy.outputs.artifact-macos-macosarm }}
+
+    steps:
+      - name: "Check out repository"
+        uses: actions/checkout@v7
+        with:
+          # This is necessary for making `git describe` work.
+          fetch-depth: 0
+
+      - name: "[Arch Linux] Workaround for the 'unsafe repository' issue caused by CVE-2022-24765"
+        if: matrix.container != null
+        # See https://github.com/actions/checkout/issues/760 for details
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: "Ensure that all tags are fetched"
+        # Works around an issue where not the latest tag is not fetched when the
+        # workflow is triggered by a tag push event.
+        # Possibly related: actions/checkout#290
+        run: git fetch origin --force --tags
+
+      - name: "[macOS] Set up cmake"
+        uses: jwlawson/actions-setup-cmake@v2.2
+        # Ubuntu 24.04 should use the CMake version from the repos.
+        if: runner.os == 'macOS'
+        with:
+          # This should always match the minimum required version in
+          # our CMakeLists.txt
+          cmake-version: "3.22.x"
+
+      - name: "[macOS] install ccache and make"
+        if: runner.os == 'macOS'
+        run: |
+          brew install ccache
+
+      - name: "[macOS/Windows] Get build environment name"
+        if: runner.os != 'Linux'
+        run: ${{ matrix.buildenv_script }} name
+
+      - name: "[macOS] Import Apple code signing identity"
+        id: apple_codesign
+        if: runner.os == 'macOS' && env.MACOS_CODESIGN_CERTIFICATE_P12_BASE64 != null && env.MACOS_CODESIGN_CERTIFICATE_PASSWORD != null
+        run: |
+          # Decode the certificate
+          echo "${{ env.MACOS_CODESIGN_CERTIFICATE_P12_BASE64 }}" | base64 -d -o ~/certificate.p12
+
+          # Create a temporary keychain for the certificate and import it.
+          security create-keychain -p mixxx Mixxx.keychain
+          security unlock-keychain -p mixxx Mixxx.keychain
+          security import ~/certificate.p12 -k Mixxx.keychain \
+            -P "${MACOS_CODESIGN_CERTIFICATE_PASSWORD}" -A
+          security find-certificate -a -Z Mixxx.keychain
+          APPLE_CODESIGN_IDENTITY="$(security find-certificate -a -Z Mixxx.keychain | grep ^SHA-1 | cut -d " " -f3 | uniq)"
+          security set-key-partition-list -S "apple-tool:,apple:" -k mixxx Mixxx.keychain
+          # Add keychain to search list
+          security list-keychains -s Mixxx.keychain
+          # Prevent keychain access from timing out
+          security set-keychain-settings Mixxx.keychain
+          echo "CMAKE_ARGS_EXTRA=${CMAKE_ARGS_EXTRA} -DAPPLE_CODESIGN_IDENTITY=${APPLE_CODESIGN_IDENTITY}" >> "${GITHUB_ENV}"
+          echo "APPLE_CODESIGN_IDENTITY=${APPLE_CODESIGN_IDENTITY}" >> $GITHUB_ENV
+
+
+      - name: "[macOS/Linux] Set up build environment"
+        if: matrix.buildenv_script != null && runner.os != 'Windows'
+        run: ${{ matrix.buildenv_script }} setup
+        env:
+          BUILDENV_BASEPATH: ${{ matrix.buildenv_basepath }}
+
+      - name: "[Ubuntu/macOS] Set up GitHub cache for ccache"
+        if: runner.os != 'windows'
+        uses: actions/cache@v6
+        with:
+          path: ${{ matrix.compiler_cache_path }}
+          key: ${{ matrix.os }}-${{ matrix.compiler_cache_id }}-${{ inputs.branch }}-${{ github.run_number }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler_cache_id }}-${{ inputs.branch }}
+            ${{ matrix.os }}-${{ matrix.compiler_cache_id }}
+
+      - name: "[Ubuntu/macOS] Set up ccache"
+        # GitHub Actions gives us 10 GB of cache.
+        # 4 runs * 2 GB = 8 GB
+        run: |
+          ${{ matrix.compiler_cache }} --zero-stats
+          ${{ matrix.compiler_cache }} --max-size=2G
+        if: runner.os != 'windows'
+
+
+      - name: "Create build directory"
+        run: mkdir build
+
+      - name: "Configure"
+        run: >-
+          cmake ${{ matrix.cmake_args }} ${{ env.CMAKE_ARGS_EXTRA }}
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_PREFIX_PATH="${{ env.CMAKE_PREFIX_PATH }}"
+          -DWARNINGS_FATAL=ON
+          -DDEBUG_ASSERTIONS_FATAL=OFF
+          -DBATTERY=ON
+          -DBROADCAST=ON
+          -DDOWNLOAD_MANUAL=ON
+          -DHID=ON
+          -DKEYFINDER=ON
+          -DLILV=ON
+          -DOPUS=ON
+          -DQTKEYCHAIN=ON
+          -DVINYLCONTROL=ON
+          -DCMAKE_VERBOSE_MAKEFILE=OFF
+          -L
+          ..
+        working-directory: build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+
+      - name: "[Ubuntu/macOS] Set up gcc/clang problem matcher"
+        if: runner.os != 'Windows'
+        uses: ammaraskar/gcc-problem-matcher@0.3.0
+
+
+      - name: "Build"
+        run: cmake --build . --config RelWithDebInfo
+        working-directory: build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          # GitHub Actions automatically zstd compresses caches
+          CCACHE_NOCOMPRESS: true
+
+      - name: "[Ubuntu/macOS] Print compiler cache stats"
+        if: runner.os != 'windows'
+        run: |
+          ${{ matrix.compiler_cache }} --show-stats
+          ${{ matrix.compiler_cache }} --cleanup
+
+      # - name: "Test"
+      #   if: matrix.crosscompile != true
+      #   run: ctest --timeout 45 ${{ matrix.ctest_args }}
+      #   working-directory: build
+      #   env:
+      #     GTEST_COLOR: 1
+      #     # Windows tests fail randomly if run in parallel
+      #     CTEST_PARALLEL_LEVEL: 1
+      #     CTEST_OUTPUT_ON_FAILURE: 1
+
+      - name: "Package"
+        id: package
+        if: matrix.cpack_generator != null
+        # Use retry loop to work around a race condition on macOS causing
+        # 'Resource busy' errors with 'hdiutil'. See
+        # https://github.com/actions/runner-images/issues/7522
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 30
+          max_attempts: ${{ runner.os == 'macOS' && 12 || 1 }}
+          retry_wait_seconds: 1
+          command: |
+            cd build
+            cpack -G ${{ matrix.cpack_generator }} -V
+
+
+
+      - name: "[macOS] Sign, Notarize, and Staple Package"
+        if: runner.os == 'macOS' && env.MACOS_CODESIGN_CERTIFICATE_P12_BASE64 != null && env.MACOS_CODESIGN_CERTIFICATE_PASSWORD != null && env.APPLE_APP_SPECIFIC_PASSWORD != null
+        run: packaging/macos/sign_notarize_staple.sh build/*.dmg
+        env:
+          APPLE_ID_USERNAME: daschuer@mixxx.org
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: JBLRSP95FC
+
+
+      - name: "Prepare for deployment"
+        # Copy the desired directory structure to the deploy/ directory. This
+        # also generates metadata for file artifact and write it to the job
+        # output using the artifacts_slug value.
+        id: prepare_deploy
+        if: inputs.publish && matrix.artifacts_path != null
+        shell: bash
+        run: >
+          if [[ "${{ inputs.ref }}" =~ ^refs/tags/.* ]];
+          then
+            export DEPLOY_PATH='releases/{git_describe}/mixxx-{git_describe}-{package_slug}{ext}';
+          else
+            export DEPLOY_PATH='snapshots/{git_branch}/mixxx-{git_describe}-{package_slug}{ext}';
+          fi;
+          python3 tools/deploy.py prepare-deployment
+          --slug '${{ matrix.artifacts_slug }}'
+          --output-dir 'deploy/'
+          --dest-path "${DEPLOY_PATH}"
+          --dest-url 'https://downloads.mixxx.org'
+          ${{ matrix.artifacts_path }}
+
+      # TODO create a F-droid repo?
+      # - name: fdroid nightly
+      #   run: |
+      #     sudo add-apt-repository ppa:fdroid/fdroidserver
+      #     sudo apt-get update
+      #     sudo apt-get install apksigner fdroidserver --no-install-recommends
+      #     export DEBUG_KEYSTORE=$
+      #     fdroid nightly --archive-older 10
+
+      # Warning: do not move this step before restoring caches or it will break caching due to
+      # https://github.com/actions/cache/issues/531
+
+      - name: "Set up SSH Agent"
+        if: inputs.publish && env.SSH_PRIVATE_KEY != null
+        shell: bash
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+          SSH_PRIVATE_KEY: ${{ secrets.DOWNLOADS_HOSTGATOR_DOT_MIXXX_DOT_ORG_KEY }}
+          SSH_HOST: downloads-hostgator.mixxx.org
+        run: |
+          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+          ssh-add - <<< "${SSH_PRIVATE_KEY}"
+          mkdir -p "${HOME}/.ssh"
+          ssh-keyscan "${SSH_HOST}" >> "${HOME}/.ssh/known_hosts"
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
+
+      - name: "Upload GitHub Actions artifacts"
+        if: matrix.artifacts_path != null
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          archive: "false"
+          path: ${{ matrix.artifacts_path }}
+
+  
